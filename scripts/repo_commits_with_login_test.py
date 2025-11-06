@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
+from datetime import datetime, timezone
+import json
 
 import requests
 from perceval.backends.core.git import Git
@@ -233,28 +235,91 @@ def collect_commits_with_login(owner: str, repo: str, gitpath: str | None, token
         if tmpdir and not gitpath:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+# ---- yearsOnPlatform helpers (REST /users/{login} + cache) ----
+def load_user_cache(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_user_cache(cache: dict, path: str):
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def fetch_user_created_at(login: str, token: str | None) -> str | None:
+    if not login:
+        return None
+    url = f"https://api.github.com/users/{login}"
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = requests.get(url, headers=headers, timeout=20)
+    if r.status_code != 200:
+        return None
+    return r.json().get("created_at")  # e.g., "2016-04-05T12:34:56Z"
+
+def years_since(iso_datetime: str) -> float | None:
+    try:
+        # normalize to aware datetime
+        s = iso_datetime.rstrip("Z")
+        dt = datetime.fromisoformat(s + "+00:00") if "T" in s and "+" not in s else datetime.fromisoformat(s)
+        now = datetime.now(timezone.utc)
+        return round((now - dt).total_seconds() / 86400.0 / 365.2425, 2)
+    except Exception:
+        return None
+
 def main():
     parser = argparse.ArgumentParser(
-        description="CSV: name,email,login,commits,merges (Perceval Git + blobless mirror + robuste Login-Zuordnung)"
+        description="CSV: name,email,login,commits,merges,yearsOnPlatform (Perceval + blobless + REST cache)"
     )
     parser.add_argument("--owner", default="M4anuel")
     parser.add_argument("--repo", default="Harmony-Hootenanny")
     parser.add_argument("--gitpath", help="Basisordner für Mirrors (…/<repo>.git). Wenn leer, Temp-Ordner.")
     parser.add_argument("--csv", default="dev_commits.csv")
     parser.add_argument("--token", help="GitHub Token (oder via $GITHUB_TOKEN)", default=os.getenv("GITHUB_TOKEN"))
+    parser.add_argument("--user-cache", default="gh_user_cache.json", help="JSON cache file for login→created_at")
     args = parser.parse_args()
 
     rows = collect_commits_with_login(args.owner, args.repo, args.gitpath, args.token)
 
-    # Sortierung: commits desc, dann name/email/login
-    rows = sorted(rows, key=lambda r: (-r["commits"], r["name"] or r["email"] or r["login"]))
+    # build yearsOnPlatform per unique login using cache
+    cache = load_user_cache(args.user_cache)
+    updated = False
+    years_map: dict[str, float | None] = {}
+    unique_logins = sorted({r["login"] for r in rows if r["login"]})
 
+    for login in unique_logins:
+        created = cache.get(login, {}).get("created_at")
+        if not created:
+            created = fetch_user_created_at(login, args.token)
+            if created:
+                cache[login] = {"created_at": created}
+                updated = True
+        yrs = years_since(created) if created else None
+        years_map[login] = yrs
+
+    if updated:
+        save_user_cache(cache, args.user_cache)
+
+    # enrich rows
+    for r in rows:
+        yrs = years_map.get(r["login"]) if r["login"] else None
+        r["yearsOnPlatform"] = f"{yrs:.2f}" if isinstance(yrs, float) else ""
+
+    # sort and write
+    rows = sorted(rows, key=lambda r: (-r["commits"], r["name"] or r["email"] or r["login"]))
     with open(args.csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["name", "email", "login", "commits", "merges"])
+        w.writerow(["name", "email", "login", "commits", "merges", "yearsOnPlatform"])
         for r in rows:
-            w.writerow([r["name"], r["email"], r["login"], r["commits"], r["merges"]])
-
+            w.writerow([r["name"], r["email"], r["login"], r["commits"], r["merges"], r["yearsOnPlatform"]])
     print(f"CSV gespeichert: {args.csv}")
 
 if __name__ == "__main__":
