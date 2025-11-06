@@ -1,0 +1,10 @@
+# virtuelle Umgebungen
+venv/
+.venv/
+
+# Bytecode / Cache
+*.pyc
+__pycache__/
+
+# lokale Outputs
+dev_commits.csv
