@@ -16,7 +16,6 @@ from perceval.backends.core.git import Git
 AUTHOR_ANGLE = re.compile(r'^(?P<name>.+?)\s*<\s*(?P<email>[^>]+?)\s*>$')
 NOREPLY_RE   = re.compile(r'^(?:\d+\+)?(?P<login>[^@]+)@users\.noreply\.github\.com$', re.I)
 
-
 def parse_author_safely(author_str: str):
     """Extrahiert (name, email) robust aus 'Name <email>' oder frei formatierten Strings."""
     if not author_str:
@@ -34,17 +33,15 @@ def parse_author_safely(author_str: str):
         name = email.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
     return name, email
 
-
 def login_from_noreply(email: str):
     if not email:
         return None
     m = NOREPLY_RE.match(email)
     return m.group("login") if m else None
 
-
 def fetch_login_via_commit(owner: str, repo: str, sha: str, token: str | None):
     """Fragt einen Commit bei GitHub ab und liefert author.login (oder None)."""
-    if not token:
+    if not token or not sha:
         return None
     url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
     r = requests.get(url, headers={
@@ -57,35 +54,61 @@ def fetch_login_via_commit(owner: str, repo: str, sha: str, token: str | None):
     author = data.get("author") or {}
     return author.get("login")
 
-
 def ensure_blobless_mirror(uri: str, mirror_path: str):
     """
-    Stellt sicher, dass unter mirror_path ein blobless Bare/Mirror liegt.
-    - Neu:   git clone --mirror --filter=blob:none <uri> <mirror_path>
-    - Update: git -C <mirror_path> remote set-url origin <uri> && git -C <mirror_path> fetch --all --prune
+    Sichert einen blobless Bare/Mirror:
+    - neu:   git clone --mirror --filter=blob:none <uri> <mirror_path>
+    - update: git -C <mirror_path> fetch --all --prune
     """
     if not os.path.exists(mirror_path):
         os.makedirs(os.path.dirname(mirror_path), exist_ok=True)
-        subprocess.check_call([
-            "git", "clone", "--mirror", "--filter=blob:none", uri, mirror_path
-        ])
+        subprocess.check_call(["git", "clone", "--mirror", "--filter=blob:none", uri, mirror_path])
     else:
-        # Falls irrtümlich ein Working-Dir geklont wurde, räumen wir auf
         if os.path.isdir(os.path.join(mirror_path, ".git")):
             shutil.rmtree(mirror_path, ignore_errors=True)
-            subprocess.check_call([
-                "git", "clone", "--mirror", "--filter=blob:none", uri, mirror_path
-            ])
+            subprocess.check_call(["git", "clone", "--mirror", "--filter=blob:none", uri, mirror_path])
         else:
-            # Mirror aktualisieren
             subprocess.check_call(["git", "-C", mirror_path, "remote", "set-url", "origin", uri])
             subprocess.check_call(["git", "-C", mirror_path, "fetch", "--all", "--prune"])
 
+# ---- Merge-Erkennung (Commit mit >1 Parent) + kleiner Cache ----
+_parent_count_cache: dict[str, int] = {}
+
+def is_merge_commit(mirror_path: str, sha: str) -> bool:
+    if not sha:
+        return False
+    if sha in _parent_count_cache:
+        return _parent_count_cache[sha] > 1
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", mirror_path, "rev-list", "--parents", "-n", "1", sha],
+            text=True
+        ).strip()
+        parent_count = max(0, len(out.split()) - 1)
+        _parent_count_cache[sha] = parent_count
+        return parent_count > 1
+    except subprocess.CalledProcessError:
+        _parent_count_cache[sha] = 0
+        return False
+
+# ---- Robuste Login-Auflösung ----
+def resolve_login(owner: str, repo: str, emails_seen: set[str], sample_shas: list[str], token: str | None):
+    # 1) noreply-Mail → Login direkt
+    for em in emails_seen:
+        ln = login_from_noreply(em)
+        if ln:
+            return ln
+    # 2) mehrere Commits via API probieren
+    if token:
+        for sha in sample_shas:
+            ln = fetch_login_via_commit(owner, repo, sha, token)
+            if ln:
+                return ln
+    return None
 
 def collect_commits_with_login(owner: str, repo: str, gitpath: str | None, token: str | None):
     """
-    Zählt Commits pro Autor (Name/Email) via Perceval Git mit blobless Mirror
-    und führt anschließend per GitHub-Login zusammen.
+    Zählt Commits & Merge-Commits pro Autor, konsolidiert Aliase robust nach Login.
     """
     tmpdir = None
     try:
@@ -102,14 +125,15 @@ def collect_commits_with_login(owner: str, repo: str, gitpath: str | None, token
         # 2) Blobless Mirror sicherstellen/aktualisieren
         ensure_blobless_mirror(uri, mirror_path)
 
-        # 3) Commits streamen (zunächst auf E-Mail/Name-Ebene sammeln)
+        # 3) Commits streamen: zuerst auf (email|name)-Ebene sammeln
         raw_people = defaultdict(lambda: {
             "name": "",
             "email": "",
             "login": None,
             "commits": 0,
-            "sample_sha": None,
-            "emails_seen": set(),   # für spätere Auswahl einer "besten" Mail
+            "merges": 0,
+            "sample_shas": [],        # NEU: mehrere Probe-SHAs
+            "emails_seen": set(),     # für beste Mail
             "names_seen": defaultdict(int)
         })
 
@@ -118,7 +142,7 @@ def collect_commits_with_login(owner: str, repo: str, gitpath: str | None, token
             sha = data.get("commit") or data.get("Commit") or data.get("sha")
             name, email = parse_author_safely(data.get("Author") or "")
 
-            key = (email or name.lower() or "unknown")
+            key = (email or (name or "").lower() or "unknown")
             p = raw_people[key]
 
             if name:
@@ -129,84 +153,89 @@ def collect_commits_with_login(owner: str, repo: str, gitpath: str | None, token
                 p["emails_seen"].add(email)
 
             p["commits"] += 1
-            if not p["sample_sha"] and sha:
-                p["sample_sha"] = sha
+            if is_merge_commit(mirror_path, sha):
+                p["merges"] += 1
 
-        # 4) Logins ermitteln
+            if sha and len(p["sample_shas"]) < 10:   # NEU: bis 10 sammeln
+                p["sample_shas"].append(sha)
+
+        # 4) Login-Auflösung (noreply → API über mehrere SHAs)
+        for p in raw_people.values():
+            p["login"] = resolve_login(owner, repo, p["emails_seen"], p["sample_shas"], token)
+
+        # 5) Login-Propagation per Name (gleicher normalisierter Name)
+        name_to_login = {}
+        for p in raw_people.values():
+            if p["login"]:
+                nm = (p["name"] or "").strip().lower()
+                if nm:
+                    name_to_login[nm] = p["login"]
         for p in raw_people.values():
             if not p["login"]:
-                p["login"] = login_from_noreply(p["email"])
-            if not p["login"] and p["sample_sha"]:
-                p["login"] = fetch_login_via_commit(owner, repo, p["sample_sha"], token)
+                nm = (p["name"] or "").strip().lower()
+                if nm in name_to_login:
+                    p["login"] = name_to_login[nm]
 
-        # 5) Auf Login-Ebene zusammenführen (Fallback: E-Mail, sonst name.lower())
+        # 6) Konsolidierung: primär nach Login, sonst E-Mail, sonst Name
         consolidated = defaultdict(lambda: {
             "name": "",
             "email": "",
             "login": "",
             "commits": 0,
+            "merges": 0,
             "emails_seen": set(),
             "names_seen": defaultdict(int)
         })
 
         for p in raw_people.values():
             if p["login"]:
-                key = ("login", p["login"].lower())
-                login_out = p["login"]
+                key = ("login", p["login"].lower()); login_out = p["login"]
             elif p["email"]:
-                key = ("email", p["email"].lower())
-                login_out = ""
+                key = ("email", p["email"].lower()); login_out = ""
             else:
-                key = ("name", (p["name"] or "").lower())
-                login_out = ""
+                key = ("name", (p["name"] or "").lower()); login_out = ""
 
             c = consolidated[key]
             c["commits"] += p["commits"]
+            c["merges"]  += p["merges"]
             c["login"] = c["login"] or login_out
-            # Namen/Emails sammeln, um beste Repräsentation zu wählen
-            for em in p["emails_seen"]:
-                c["emails_seen"].add(em)
+            c["emails_seen"].update(p["emails_seen"])
             for n, cnt in p["names_seen"].items():
                 c["names_seen"][n] += cnt
 
-        # 6) Beste "name" & "email" auswählen
+        # 7) Beste Darstellung für Name/Email
         def pick_best_email(emails: set[str]) -> str:
             if not emails:
                 return ""
-            # Bevorzugt nicht-noreply
             normal = [e for e in emails if not NOREPLY_RE.match(e)]
-            if normal:
-                # Nimm die "kürzeste" als Heuristik (oft primäre Uni-/persönliche Mail)
-                return sorted(normal, key=len)[0]
-            return sorted(emails, key=len)[0]
+            return sorted(normal or list(emails), key=len)[0]
 
         def pick_best_name(names_cnt: dict[str, int]) -> str:
             if not names_cnt:
                 return ""
-            # meistverwendeter Name; bei Gleichstand längerer Name
             most = max(names_cnt.items(), key=lambda kv: (kv[1], len(kv[0])))
             return most[0]
 
-        # finale Liste bauen
+        # 8) Finale Zeilen
         final_rows = []
         for (_kind, _key), c in consolidated.items():
             final_rows.append({
                 "name": pick_best_name(c["names_seen"]),
                 "email": pick_best_email(c["emails_seen"]),
                 "login": c["login"],
-                "commits": c["commits"]
+                "commits": c["commits"],
+                "merges": c["merges"],
             })
 
         return final_rows
 
     finally:
-        if tmpdir:
+        if tmpdir and not gitpath:
             shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CSV: name,email,login,commits (Perceval Git + blobless mirror + Login-Zusammenführung)"
+        description="CSV: name,email,login,commits,merges (Perceval Git + blobless mirror + robuste Login-Zuordnung)"
     )
     parser.add_argument("--owner", default="M4anuel")
     parser.add_argument("--repo", default="Harmony-Hootenanny")
@@ -217,17 +246,16 @@ def main():
 
     rows = collect_commits_with_login(args.owner, args.repo, args.gitpath, args.token)
 
-    # Sortierung: commits desc, dann name/email
+    # Sortierung: commits desc, dann name/email/login
     rows = sorted(rows, key=lambda r: (-r["commits"], r["name"] or r["email"] or r["login"]))
 
     with open(args.csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["name", "email", "login", "commits"])
+        w.writerow(["name", "email", "login", "commits", "merges"])
         for r in rows:
-            w.writerow([r["name"], r["email"], r["login"], r["commits"]])
+            w.writerow([r["name"], r["email"], r["login"], r["commits"], r["merges"]])
 
     print(f"CSV gespeichert: {args.csv}")
-
 
 if __name__ == "__main__":
     main()
